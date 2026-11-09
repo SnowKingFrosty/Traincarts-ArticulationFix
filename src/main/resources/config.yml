@@ -1,0 +1,7 @@
+# Length (in blocks) of the bellows model at scale 1.0 along its local Z axis.
+base-length: 1.0
+# Scale is clamped to this range.
+min-scale: 0.05
+max-scale: 8.0
+# Update period in ticks.
+update-interval: 1

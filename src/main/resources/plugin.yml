@@ -1,0 +1,5 @@
+name: TraincartsArticulationFix
+version: 1.0.0
+main: dev.articulationfix.ArticulationFixPlugin
+api-version: "26.1"
+depend: [BKCommonLib, Train_Carts]
