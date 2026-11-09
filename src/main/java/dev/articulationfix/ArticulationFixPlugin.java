@@ -1,18 +1,21 @@
 package dev.articulationfix;
 
 import com.bergerkiller.bukkit.common.math.Matrix4x4;
+import com.bergerkiller.bukkit.tc.attachments.VirtualDisplayEntity;
+import com.bergerkiller.bukkit.tc.attachments.VirtualHybridItemEntity;
+import com.bergerkiller.bukkit.tc.attachments.VirtualSpawnableObject;
 import com.bergerkiller.bukkit.tc.attachments.api.Attachment;
+import com.bergerkiller.bukkit.tc.attachments.control.CartAttachmentItem;
 import com.bergerkiller.bukkit.tc.controller.MinecartGroup;
 import com.bergerkiller.bukkit.tc.controller.MinecartMember;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.util.Vector;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.WeakHashMap;
 
 /**
  * Scales the "LinkA"/"LinkB" attachments of each cart so they reach the
@@ -22,6 +25,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * LinkB stretches towards LinkBConnection of the next cart in the train (index + 1).
  */
 public final class ArticulationFixPlugin extends JavaPlugin {
+    private static final double MAX_DISTANCE_SQUARED = 9.0;
+    private static final Field ITEM_ENTITY = field(CartAttachmentItem.class, "entity");
+    private static final Field HYBRID_DISPLAY = field(VirtualHybridItemEntity.class, "display");
+    private final Map<VirtualDisplayEntity, Vector> originalScales = new WeakHashMap<>();
     private double baseLength;
     private double minScale;
     private double maxScale;
@@ -46,13 +53,13 @@ public final class ArticulationFixPlugin extends JavaPlugin {
                 if (root == null) continue;
 
                 Attachment linkA = find(root, "LinkA");
-                if (linkA != null && i > 0) {
-                    Attachment target = find(group.get(i - 1).getAttachments().getRootAttachment(), "LinkAConnection");
+                if (linkA != null) {
+                    Attachment target = i > 0 ? findNearby(group.get(i - 1).getAttachments().getRootAttachment(), "LinkAConnection", position(linkA)) : null;
                     stretch(linkA, target);
                 }
                 Attachment linkB = find(root, "LinkB");
-                if (linkB != null && i < size - 1) {
-                    Attachment target = find(group.get(i + 1).getAttachments().getRootAttachment(), "LinkBConnection");
+                if (linkB != null) {
+                    Attachment target = i < size - 1 ? findNearby(group.get(i + 1).getAttachments().getRootAttachment(), "LinkBConnection", position(linkB)) : null;
                     stretch(linkB, target);
                 }
             }
@@ -60,11 +67,25 @@ public final class ArticulationFixPlugin extends JavaPlugin {
     }
 
     private void stretch(Attachment link, Attachment target) {
-        if (target == null) return;
-        Vector from = position(link);
-        Vector to = position(target);
-        double scale = Math.min(maxScale, Math.max(minScale, from.distance(to) / baseLength));
-        setScale(link, scale);
+        VirtualSpawnableObject entity = itemEntity(link);
+        if (entity == null) return;
+        VirtualDisplayEntity display = display(entity);
+        if (display == null) return;
+        Matrix4x4 transform = link.getTransform().clone();
+        if (target == null) {
+            Vector originalScale = originalScales.remove(display);
+            if (originalScale == null) return;
+            display.setScale(originalScale);
+        } else {
+            Vector from = position(link);
+            Vector to = position(target);
+            transform.worldTranslate(to.clone().subtract(from).multiply(0.5));
+            Vector originalScale = originalScales.computeIfAbsent(display, ignored -> display.getScale().clone());
+            double scale = Math.min(maxScale, Math.max(minScale, from.distance(to) / baseLength));
+            display.setScale(new Vector(originalScale.getX(), originalScale.getY(), scale));
+        }
+        entity.updatePosition(transform);
+        entity.syncPosition(false);
     }
 
     private static Vector position(Attachment a) {
@@ -86,31 +107,54 @@ public final class ArticulationFixPlugin extends JavaPlugin {
         return null;
     }
 
-    // TrainCarts exposes no public scale API, so locate the display entity inside the attachment.
-    private static final Map<Class<?>, Object[]> CACHE = new ConcurrentHashMap<>();
-    private static final Object[] NONE = new Object[0];
-
-    private static void setScale(Attachment attachment, double z) {
-        Class<?> cls = attachment.getClass();
-        Object[] info = CACHE.computeIfAbsent(cls, c -> {
-            for (Class<?> k = c; k != null && k != Object.class; k = k.getSuperclass()) {
-                for (Field f : k.getDeclaredFields()) {
-                    for (Method m : f.getType().getMethods()) {
-                        if (m.getName().equals("setScale") && m.getParameterCount() == 1
-                                && m.getParameterTypes()[0] == Vector.class) {
-                            f.setAccessible(true);
-                            return new Object[]{f, m};
-                        }
-                    }
+    private static Attachment findNearby(Attachment root, String name, Vector from) {
+        if (root == null) return null;
+        Attachment nearest = null;
+        double nearestDistance = MAX_DISTANCE_SQUARED;
+        Deque<Attachment> queue = new ArrayDeque<>();
+        queue.add(root);
+        while (!queue.isEmpty()) {
+            Attachment candidate = queue.poll();
+            if (candidate.getNames().contains(name)) {
+                double distance = from.distanceSquared(position(candidate));
+                if (distance <= nearestDistance) {
+                    nearest = candidate;
+                    nearestDistance = distance;
                 }
             }
-            return NONE;
-        });
-        if (info.length == 0) return;
-        try {
-            Object entity = ((Field) info[0]).get(attachment);
-            if (entity != null) ((Method) info[1]).invoke(entity, new Vector(1.0, 1.0, z));
-        } catch (ReflectiveOperationException ignored) {
+            queue.addAll(candidate.getChildren());
         }
+        return nearest;
+    }
+
+    private static Field field(Class<?> owner, String name) {
+        try {
+            Field field = owner.getDeclaredField(name);
+            field.setAccessible(true);
+            return field;
+        } catch (NoSuchFieldException exception) {
+            throw new IllegalStateException("Unsupported TrainCarts version", exception);
+        }
+    }
+
+    private static VirtualSpawnableObject itemEntity(Attachment attachment) {
+        if (!(attachment instanceof CartAttachmentItem)) return null;
+        try {
+            return (VirtualSpawnableObject) ITEM_ENTITY.get(attachment);
+        } catch (IllegalAccessException exception) {
+            throw new IllegalStateException(exception);
+        }
+    }
+
+    private static VirtualDisplayEntity display(VirtualSpawnableObject entity) {
+        if (entity instanceof VirtualDisplayEntity display) return display;
+        if (entity instanceof VirtualHybridItemEntity) {
+            try {
+                return (VirtualDisplayEntity) HYBRID_DISPLAY.get(entity);
+            } catch (IllegalAccessException exception) {
+                throw new IllegalStateException(exception);
+            }
+        }
+        return null;
     }
 }
